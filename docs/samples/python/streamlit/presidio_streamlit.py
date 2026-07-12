@@ -1,7 +1,9 @@
 """Streamlit app for Presidio."""
+import io
 import logging
 import os
 import traceback
+from pathlib import Path
 
 import dotenv
 import pandas as pd
@@ -18,6 +20,7 @@ from presidio_helpers import (
     annotate,
     create_fake_data,
     analyzer_engine,
+    extract_text_from_file,
 )
 
 st.set_page_config(
@@ -267,21 +270,8 @@ analyzer_load_state = st.info("Starting Presidio analyzer...")
 
 analyzer_load_state.empty()
 
-# Read default text
-with open("demo_text.txt") as f:
-    demo_text = f.readlines()
-
-# Create two columns for before and after
-col1, col2 = st.columns(2)
-
-# Before:
-col1.subheader("Input")
-st_text = col1.text_area(
-    label="Enter text", value="".join(demo_text), height=400, key="text_input"
-)
-
+# ── Sidebar: Entity selector (shared across both tabs) ─────────────────────────
 try:
-    # Choose entities
     st_entities_expander = st.sidebar.expander("Choose entities to look for")
     st_entities = st_entities_expander.multiselect(
         label="Which entities to look for?",
@@ -291,87 +281,296 @@ try:
         "This list is dynamic and based on the NER model and registered recognizers. "
         "More information can be found here: https://data-privacy-stack.github.io/presidio/analyzer/adding_recognizers/",
     )
-
-    # Before
-    analyzer_load_state = st.info("Starting Presidio analyzer...")
-    analyzer = analyzer_engine(*analyzer_params)
-    analyzer_load_state.empty()
-
-    st_analyze_results = analyze(
-        *analyzer_params,
-        text=st_text,
-        entities=st_entities,
-        language="en",
-        score_threshold=st_threshold,
-        return_decision_process=st_return_decision_process,
-        allow_list=st_allow_list,
-        deny_list=st_deny_list,
-    )
-
-    # After
-    if st_operator not in ("highlight", "synthesize"):
-        with col2:
-            st.subheader(f"Output")
-            st_anonymize_results = anonymize(
-                text=st_text,
-                operator=st_operator,
-                mask_char=st_mask_char,
-                number_of_chars=st_number_of_chars,
-                encrypt_key=st_encrypt_key,
-                analyze_results=st_analyze_results,
-            )
-            st.text_area(
-                label="De-identified", value=st_anonymize_results.text, height=400
-            )
-    elif st_operator == "synthesize":
-        with col2:
-            st.subheader(f"OpenAI Generated output")
-            fake_data = create_fake_data(
-                st_text,
-                st_analyze_results,
-                open_ai_params,
-            )
-            st.text_area(label="Synthetic data", value=fake_data, height=400)
-    else:
-        st.subheader("Highlighted")
-        annotated_tokens = annotate(text=st_text, analyze_results=st_analyze_results)
-        # annotated_tokens
-        annotated_text(*annotated_tokens)
-
-    # table result
-    st.subheader(
-        "Findings"
-        if not st_return_decision_process
-        else "Findings with decision factors"
-    )
-    if st_analyze_results:
-        df = pd.DataFrame.from_records([r.to_dict() for r in st_analyze_results])
-        df["text"] = [st_text[res.start : res.end] for res in st_analyze_results]
-
-        df_subset = df[["entity_type", "text", "start", "end", "score"]].rename(
-            {
-                "entity_type": "Entity type",
-                "text": "Text",
-                "start": "Start",
-                "end": "End",
-                "score": "Confidence",
-            },
-            axis=1,
-        )
-        df_subset["Text"] = [st_text[res.start : res.end] for res in st_analyze_results]
-        if st_return_decision_process:
-            analysis_explanation_df = pd.DataFrame.from_records(
-                [r.analysis_explanation.to_dict() for r in st_analyze_results]
-            )
-            df_subset = pd.concat([df_subset, analysis_explanation_df], axis=1)
-        st.dataframe(df_subset.reset_index(drop=True), use_container_width=True)
-    else:
-        st.text("No findings")
-
 except Exception as e:
-    print(e)
-    traceback.print_exc()
-    st.error(e)
+    st.sidebar.error(f"Could not load entities: {e}")
+    st_entities = []
+
+# ── Main Tabs ──────────────────────────────────────────────────────────────────
+tab_text, tab_file = st.tabs(["📝 Text Input", "📂 File Upload & Masking"])
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — Original text input UI (unchanged)
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_text:
+    # Read default text
+    with open("demo_text.txt") as f:
+        demo_text = f.readlines()
+
+    # Create two columns for before and after
+    col1, col2 = st.columns(2)
+
+    # Before:
+    col1.subheader("Input")
+    st_text = col1.text_area(
+        label="Enter text", value="".join(demo_text), height=400, key="text_input"
+    )
+
+    try:
+        # Before
+        analyzer_load_state = st.info("Starting Presidio analyzer...")
+        analyzer = analyzer_engine(*analyzer_params)
+        analyzer_load_state.empty()
+
+        st_analyze_results = analyze(
+            *analyzer_params,
+            text=st_text,
+            entities=st_entities,
+            language="en",
+            score_threshold=st_threshold,
+            return_decision_process=st_return_decision_process,
+            allow_list=st_allow_list,
+            deny_list=st_deny_list,
+        )
+
+        # After
+        if st_operator not in ("highlight", "synthesize"):
+            with col2:
+                st.subheader("Output")
+                st_anonymize_results = anonymize(
+                    text=st_text,
+                    operator=st_operator,
+                    mask_char=st_mask_char,
+                    number_of_chars=st_number_of_chars,
+                    encrypt_key=st_encrypt_key,
+                    analyze_results=st_analyze_results,
+                )
+                st.text_area(
+                    label="De-identified", value=st_anonymize_results.text, height=400
+                )
+        elif st_operator == "synthesize":
+            with col2:
+                st.subheader("OpenAI Generated output")
+                fake_data = create_fake_data(
+                    st_text,
+                    st_analyze_results,
+                    open_ai_params,
+                )
+                st.text_area(label="Synthetic data", value=fake_data, height=400)
+        else:
+            st.subheader("Highlighted")
+            annotated_tokens = annotate(text=st_text, analyze_results=st_analyze_results)
+            annotated_text(*annotated_tokens)
+
+        # table result
+        st.subheader(
+            "Findings"
+            if not st_return_decision_process
+            else "Findings with decision factors"
+        )
+        if st_analyze_results:
+            df = pd.DataFrame.from_records([r.to_dict() for r in st_analyze_results])
+            df["text"] = [st_text[res.start : res.end] for res in st_analyze_results]
+            df_subset = df[["entity_type", "text", "start", "end", "score"]].rename(
+                {
+                    "entity_type": "Entity type",
+                    "text": "Text",
+                    "start": "Start",
+                    "end": "End",
+                    "score": "Confidence",
+                },
+                axis=1,
+            )
+            df_subset["Text"] = [st_text[res.start : res.end] for res in st_analyze_results]
+            if st_return_decision_process:
+                analysis_explanation_df = pd.DataFrame.from_records(
+                    [r.analysis_explanation.to_dict() for r in st_analyze_results]
+                )
+                df_subset = pd.concat([df_subset, analysis_explanation_df], axis=1)
+            st.dataframe(df_subset.reset_index(drop=True), use_container_width=True)
+        else:
+            st.text("No findings")
+
+    except Exception as e:
+        print(e)
+        traceback.print_exc()
+        st.error(e)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — File Upload & Masking
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_file:
+    st.subheader("📂 Upload a File for PII Detection & Masking")
+    st.caption(
+        "Supported formats: **TXT, CSV, PDF, DOCX, XLSX, XLS** · "
+        "Max file size: 200 MB · "
+        "Uses the same NER model and settings selected in the sidebar."
+    )
+
+    uploaded_file = st.file_uploader(
+        label="Choose a file",
+        type=["txt", "csv", "pdf", "docx", "xlsx", "xls"],
+        key="file_uploader",
+        help="Upload a file to extract its text and run PII detection & anonymization.",
+    )
+
+    if uploaded_file is not None:
+        st.info(f"📄 **{uploaded_file.name}** ({uploaded_file.size:,} bytes)")
+
+        col_run, col_lang = st.columns([3, 1])
+        with col_lang:
+            file_language = st.selectbox(
+                "Language",
+                options=["en", "de", "es", "fr", "it", "pt", "nl"],
+                index=0,
+                key="file_language",
+                help="Language of the document text.",
+            )
+        with col_run:
+            run_btn = st.button(
+                "🔍 Analyze & Mask",
+                type="primary",
+                key="run_file_analysis",
+                use_container_width=True,
+            )
+
+        if run_btn:
+            try:
+                # ── Step 1: Extract text from file ──────────────────────────
+                with st.spinner("Extracting text from file..."):
+                    extracted_text = extract_text_from_file(uploaded_file)
+
+                if not extracted_text.strip():
+                    st.warning("⚠️ No readable text found in the file.")
+                    st.stop()
+
+                st.success(f"✅ Extracted **{len(extracted_text):,}** characters.")
+
+                # ── Step 2: Analyze (find PII) ───────────────────────────────
+                with st.spinner("Running PII analysis..."):
+                    file_analyze_results = analyze(
+                        *analyzer_params,
+                        text=extracted_text,
+                        entities=st_entities if st_entities else None,
+                        language=file_language,
+                        score_threshold=st_threshold,
+                        return_decision_process=st_return_decision_process,
+                        allow_list=st_allow_list,
+                        deny_list=st_deny_list,
+                    )
+
+                # ── Step 3: Anonymize (mask PII) ─────────────────────────────
+                with st.spinner("Masking PII entities..."):
+                    if file_analyze_results:
+                        file_anonymize_result = anonymize(
+                            text=extracted_text,
+                            operator=st_operator if st_operator != "synthesize" else "replace",
+                            mask_char=st_mask_char,
+                            number_of_chars=st_number_of_chars,
+                            encrypt_key=st_encrypt_key,
+                            analyze_results=file_analyze_results,
+                        )
+                        masked_text = file_anonymize_result.text
+                    else:
+                        masked_text = extracted_text
+
+                # ── Step 4: Display results ───────────────────────────────────
+                entity_count = len(file_analyze_results)
+                entity_types = list(
+                    {r.entity_type: None for r in file_analyze_results}.keys()
+                )
+
+                # Summary metrics
+                m1, m2, m3 = st.columns(3)
+                m1.metric("PII entities found", entity_count)
+                m2.metric("Unique entity types", len(entity_types))
+                m3.metric("Characters processed", f"{len(extracted_text):,}")
+
+                # Before / After comparison
+                fc1, fc2 = st.columns(2)
+                with fc1:
+                    st.subheader("Original Text")
+                    st.text_area(
+                        label="Extracted content",
+                        value=extracted_text,
+                        height=400,
+                        key="file_original",
+                        disabled=True,
+                    )
+                with fc2:
+                    st.subheader("Masked Text")
+                    st.text_area(
+                        label="After masking",
+                        value=masked_text,
+                        height=400,
+                        key="file_masked",
+                        disabled=True,
+                    )
+
+                # ── Step 5: Download masked file ──────────────────────────────
+                stem = Path(uploaded_file.name).stem
+                out_name = f"{stem}_masked.txt"
+                st.download_button(
+                    label=f"⬇️ Download masked file ({out_name})",
+                    data=masked_text.encode("utf-8"),
+                    file_name=out_name,
+                    mime="text/plain; charset=utf-8",
+                    type="primary",
+                    key="download_masked",
+                )
+
+                # ── Step 6: Findings table ────────────────────────────────────
+                st.subheader(
+                    "Findings"
+                    if not st_return_decision_process
+                    else "Findings with decision factors"
+                )
+                if file_analyze_results:
+                    fdf = pd.DataFrame.from_records(
+                        [r.to_dict() for r in file_analyze_results]
+                    )
+                    fdf["text"] = [
+                        extracted_text[r.start : r.end] for r in file_analyze_results
+                    ]
+                    fdf_subset = fdf[
+                        ["entity_type", "text", "start", "end", "score"]
+                    ].rename(
+                        {
+                            "entity_type": "Entity type",
+                            "text": "Text",
+                            "start": "Start",
+                            "end": "End",
+                            "score": "Confidence",
+                        },
+                        axis=1,
+                    )
+                    if st_return_decision_process:
+                        exp_df = pd.DataFrame.from_records(
+                            [
+                                r.analysis_explanation.to_dict()
+                                for r in file_analyze_results
+                            ]
+                        )
+                        fdf_subset = pd.concat([fdf_subset, exp_df], axis=1)
+                    st.dataframe(
+                        fdf_subset.reset_index(drop=True), use_container_width=True
+                    )
+                else:
+                    st.success("✅ No PII entities detected in this file.")
+
+            except Exception as e:
+                traceback.print_exc()
+                st.error(f"❌ Error processing file: {e}")
+    else:
+        st.markdown(
+            """
+            ### How to use
+            1. 📤 **Upload** a file using the button above
+            2. ⚙️ Configure the **NER model**, **masking strategy**, and **threshold** in the sidebar
+            3. 🔍 Click **Analyze & Mask**
+            4. ⬇️ **Download** the masked file
+
+            ---
+            **Supported file types:**
+            | Format | Extension |
+            |--------|-----------|
+            | Plain text | `.txt` |
+            | CSV spreadsheet | `.csv` |
+            | PDF document | `.pdf` |
+            | Word document | `.docx` |
+            | Excel (new) | `.xlsx` |
+            | Excel (legacy) | `.xls` |
+            """
+        )
 
 components.html(
     """

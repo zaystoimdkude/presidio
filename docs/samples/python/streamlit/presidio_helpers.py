@@ -27,6 +27,7 @@ from presidio_nlp_engine_config import (
     create_nlp_engine_with_azure_ai_language,
     create_nlp_engine_with_stanza,
 )
+from custom_recognizers import get_all_custom_recognizers
 
 logger = logging.getLogger("presidio-streamlit")
 
@@ -83,6 +84,18 @@ def analyzer_engine(
         model_family, model_path, ta_key, ta_endpoint
     )
     analyzer = AnalyzerEngine(nlp_engine=nlp_engine, registry=registry)
+
+    # ── Custom recognizers: Mongolian National ID + IBAN ──────────────────────
+    for recognizer in get_all_custom_recognizers():
+        try:
+            analyzer.registry.add_recognizer(recognizer)
+        except Exception as e:
+            logger.warning(f"Could not register {recognizer.name}: {e}")
+    logger.info(
+        "Custom recognizers registered: MN_NATIONAL_ID, IBAN_CODE"
+    )
+    # ─────────────────────────────────────────────────────────────────────────
+
     return analyzer
 
 
@@ -97,9 +110,12 @@ def get_supported_entities(
     model_family: str, model_path: str, ta_key: str, ta_endpoint: str
 ):
     """Return supported entities from the Analyzer Engine."""
-    return analyzer_engine(
+    base = analyzer_engine(
         model_family, model_path, ta_key, ta_endpoint
-    ).get_supported_entities() + ["GENERIC_PII"]
+    ).get_supported_entities()
+    # Ensure custom entities appear in the entity selector
+    custom = ["MN_NATIONAL_ID", "IBAN_CODE", "GENERIC_PII"]
+    return base + [e for e in custom if e not in base]
 
 
 @st.cache_data
@@ -255,3 +271,110 @@ def create_ad_hoc_regex_recognizer(
         supported_entity=entity_type, patterns=[pattern], context=context
     )
     return regex_recognizer
+
+
+# ── File Text Extraction Helpers ────────────────────────────────────────────────
+
+def extract_text_from_txt(file_bytes: bytes) -> str:
+    """Extract text from TXT or CSV files, trying common encodings."""
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return file_bytes.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return file_bytes.decode("utf-8", errors="replace")
+
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    """Extract text from PDF using pdfplumber."""
+    import io
+    try:
+        import pdfplumber
+    except ImportError:
+        raise ImportError("pdfplumber is not installed. Run: pip install pdfplumber")
+
+    text_parts = []
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_parts.append(page_text)
+    return "\n".join(text_parts)
+
+
+def extract_text_from_docx(file_bytes: bytes) -> str:
+    """Extract text from DOCX (paragraphs + table cells) using python-docx."""
+    import io
+    try:
+        from docx import Document
+    except ImportError:
+        raise ImportError("python-docx is not installed. Run: pip install python-docx")
+
+    doc = Document(io.BytesIO(file_bytes))
+    parts = []
+    for para in doc.paragraphs:
+        if para.text.strip():
+            parts.append(para.text)
+    for table in doc.tables:
+        for row in table.rows:
+            row_text = "\t".join(
+                cell.text.strip() for cell in row.cells if cell.text.strip()
+            )
+            if row_text:
+                parts.append(row_text)
+    return "\n".join(parts)
+
+
+def extract_text_from_excel(file_bytes: bytes, suffix: str) -> str:
+    """Extract text from XLSX or XLS files."""
+    import io
+    rows = []
+    if suffix == ".xlsx":
+        try:
+            import openpyxl
+        except ImportError:
+            raise ImportError("openpyxl is not installed. Run: pip install openpyxl")
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+        for sheet in wb.worksheets:
+            rows.append(f"[Sheet: {sheet.title}]")
+            for row in sheet.iter_rows(values_only=True):
+                cells = [str(c) for c in row if c is not None]
+                if cells:
+                    rows.append("\t".join(cells))
+    else:  # .xls
+        try:
+            import xlrd
+        except ImportError:
+            raise ImportError("xlrd is not installed. Run: pip install xlrd")
+        wb = xlrd.open_workbook(file_contents=file_bytes)
+        for sheet in wb.sheets():
+            rows.append(f"[Sheet: {sheet.name}]")
+            for r in range(sheet.nrows):
+                cells = [str(sheet.cell_value(r, c)) for c in range(sheet.ncols)]
+                if any(c.strip() for c in cells):
+                    rows.append("\t".join(cells))
+    return "\n".join(rows)
+
+
+def extract_text_from_file(uploaded_file) -> str:
+    """
+    Extract plain text from a Streamlit UploadedFile object.
+    Supports: .txt, .csv, .pdf, .docx, .xlsx, .xls
+    """
+    from pathlib import Path
+    file_bytes = uploaded_file.read()
+    suffix = Path(uploaded_file.name).suffix.lower()
+
+    if suffix in (".txt", ".csv"):
+        return extract_text_from_txt(file_bytes)
+    elif suffix == ".pdf":
+        return extract_text_from_pdf(file_bytes)
+    elif suffix == ".docx":
+        return extract_text_from_docx(file_bytes)
+    elif suffix in (".xlsx", ".xls"):
+        return extract_text_from_excel(file_bytes, suffix)
+    else:
+        raise ValueError(
+            f"Unsupported file type: '{suffix}'. "
+            "Allowed: .txt, .csv, .pdf, .docx, .xlsx, .xls"
+        )

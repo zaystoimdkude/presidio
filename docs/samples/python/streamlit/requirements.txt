@@ -10,3 +10,8 @@ torch>=2.8.0
 flair>=0.15.0
 openai
 azure-ai-textanalytics
+# File upload & parsing
+pdfplumber>=0.11.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
+xlrd>=2.0.1
